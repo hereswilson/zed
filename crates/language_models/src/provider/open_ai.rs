@@ -556,7 +556,7 @@ impl LanguageModel for OpenAiLanguageModel {
             );
             let completions = self.stream_response(request, cx);
             async move {
-                let mapper = OpenAiResponseEventMapper::new();
+                let mapper = OpenAiResponseEventMapper::for_provider(PROVIDER_NAME);
                 Ok(mapper.map_stream(completions.await?).boxed())
             }
             .boxed()
@@ -572,7 +572,7 @@ impl LanguageModel for OpenAiLanguageModel {
             );
             let completions = self.stream_completion(request, cx);
             async move {
-                let mapper = OpenAiEventMapper::new();
+                let mapper = OpenAiEventMapper::for_provider(PROVIDER_NAME);
                 Ok(mapper.map_stream(completions.await?).boxed())
             }
             .boxed()

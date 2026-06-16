@@ -177,6 +177,14 @@ pub enum LanguageModelCompletionError {
     StreamEndedUnexpectedly { provider: LanguageModelProviderName },
     #[error("payment required to use this language model; please upgrade your account")]
     PaymentRequired,
+    #[error(
+        "{provider} returned a response that does not match the expected {spec} format: {message}"
+    )]
+    ProviderCompatibilityError {
+        provider: LanguageModelProviderName,
+        spec: String,
+        message: String,
+    },
     #[error(transparent)]
     Other(#[from] anyhow::Error),
 }

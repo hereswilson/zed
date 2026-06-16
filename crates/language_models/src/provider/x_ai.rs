@@ -448,7 +448,7 @@ impl LanguageModel for XAiLanguageModel {
         );
         let completions = self.stream_completion(request, cx);
         async move {
-            let mapper = crate::provider::open_ai::OpenAiEventMapper::new();
+            let mapper = crate::provider::open_ai::OpenAiEventMapper::for_provider(PROVIDER_NAME);
             Ok(mapper.map_stream(completions.await?).boxed())
         }
         .boxed()

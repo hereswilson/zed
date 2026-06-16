@@ -345,8 +345,9 @@ impl LanguageModel for OpenAiCompatibleLanguageModel {
                 self.model.capabilities.interleaved_reasoning,
             );
             let completions = self.stream_completion(request, cx);
+            let provider_name = self.provider_name.clone();
             async move {
-                let mapper = OpenAiEventMapper::new();
+                let mapper = OpenAiEventMapper::for_provider(provider_name);
                 Ok(mapper.map_stream(completions.await?).boxed())
             }
             .boxed()
@@ -363,8 +364,9 @@ impl LanguageModel for OpenAiCompatibleLanguageModel {
                 self.model.reasoning_effort == Some(open_ai::ReasoningEffort::None),
             );
             let completions = self.stream_response(request, cx);
+            let provider_name = self.provider_name.clone();
             async move {
-                let mapper = OpenAiResponseEventMapper::new();
+                let mapper = OpenAiResponseEventMapper::for_provider(provider_name);
                 Ok(mapper.map_stream(completions.await?).boxed())
             }
             .boxed()

@@ -3,9 +3,10 @@ use collections::HashMap;
 use futures::{Stream, StreamExt};
 use language_model_core::{
     CompactionContent, LanguageModelCompletionError, LanguageModelCompletionEvent,
-    LanguageModelImage, LanguageModelRequest, LanguageModelRequestMessage, LanguageModelToolChoice,
-    LanguageModelToolResultContent, LanguageModelToolUse, LanguageModelToolUseId, MessageContent,
-    Role, StopReason, TokenUsage,
+    LanguageModelImage, LanguageModelProviderName, LanguageModelRequest,
+    LanguageModelRequestMessage, LanguageModelToolChoice, LanguageModelToolResultContent,
+    LanguageModelToolUse, LanguageModelToolUseId, MessageContent, OPEN_AI_PROVIDER_NAME, Role,
+    StopReason, TokenUsage,
     util::{fix_streamed_json, parse_tool_arguments},
 };
 use std::pin::Pin;
@@ -20,8 +21,9 @@ use crate::responses::{
     ResponseUsage as ResponsesUsage, StreamEvent as ResponsesStreamEvent,
 };
 use crate::{
-    FunctionContent, FunctionDefinition, ImageUrl, MessagePart, ReasoningEffort,
-    ResponseStreamEvent, ServiceTier, ToolCall, ToolCallContent,
+    FunctionContent, FunctionDefinition, ImageUrl, MessagePart, OPEN_AI_CHAT_COMPLETIONS_SPEC,
+    ReasoningEffort, ResponseStreamEvent, ResponseStreamParseError, ServiceTier, ToolCall,
+    ToolCallContent,
 };
 
 const RESPONSE_MESSAGE_PHASE_COMMENTARY: &str = "commentary";
@@ -564,12 +566,78 @@ fn add_message_content_part(
 
 pub struct OpenAiEventMapper {
     tool_calls_by_index: HashMap<usize, RawToolCall>,
+    provider: LanguageModelProviderName,
+}
+
+fn map_stream_error(
+    provider: &LanguageModelProviderName,
+    error: anyhow::Error,
+) -> LanguageModelCompletionError {
+    match error.downcast::<ResponseStreamParseError>() {
+        Ok(error) => LanguageModelCompletionError::ProviderCompatibilityError {
+            provider: provider.clone(),
+            spec: error.spec.to_string(),
+            message: error.message,
+        },
+        Err(error) => LanguageModelCompletionError::Other(error),
+    }
 }
 
 impl OpenAiEventMapper {
     pub fn new() -> Self {
+        Self::for_provider(OPEN_AI_PROVIDER_NAME)
+    }
+
+    pub fn for_provider(provider: LanguageModelProviderName) -> Self {
         Self {
             tool_calls_by_index: HashMap::default(),
+            provider,
+        }
+    }
+
+    fn provider_compatibility_error(
+        &self,
+        message: impl Into<String>,
+    ) -> LanguageModelCompletionError {
+        LanguageModelCompletionError::ProviderCompatibilityError {
+            provider: self.provider.clone(),
+            spec: OPEN_AI_CHAT_COMPLETIONS_SPEC.to_string(),
+            message: message.into(),
+        }
+    }
+
+    fn completed_tool_call_event(
+        &self,
+        tool_call: RawToolCall,
+    ) -> Result<LanguageModelCompletionEvent, LanguageModelCompletionError> {
+        if tool_call.id.is_empty() {
+            return Err(self.provider_compatibility_error(
+                "`choices[].delta.tool_calls[].id` is missing or empty",
+            ));
+        }
+        if tool_call.name.is_empty() {
+            return Err(self.provider_compatibility_error(
+                "`choices[].delta.tool_calls[].function.name` is missing or empty",
+            ));
+        }
+
+        match parse_tool_arguments(&tool_call.arguments) {
+            Ok(input) => Ok(LanguageModelCompletionEvent::ToolUse(
+                LanguageModelToolUse {
+                    id: tool_call.id.clone().into(),
+                    name: tool_call.name.as_str().into(),
+                    is_input_complete: true,
+                    input,
+                    raw_input: tool_call.arguments.clone(),
+                    thought_signature: None,
+                },
+            )),
+            Err(error) => Ok(LanguageModelCompletionEvent::ToolUseJsonParseError {
+                id: tool_call.id.into(),
+                tool_name: tool_call.name.into(),
+                raw_input: tool_call.arguments.clone().into(),
+                json_parse_error: error.to_string(),
+            }),
         }
     }
 
@@ -581,7 +649,7 @@ impl OpenAiEventMapper {
         events.flat_map(move |event| {
             futures::stream::iter(match event {
                 Ok(event) => self.map_event(event),
-                Err(error) => vec![Err(LanguageModelCompletionError::from(anyhow!(error)))],
+                Err(error) => vec![Err(map_stream_error(&self.provider, error))],
             })
         })
     }
@@ -669,26 +737,17 @@ impl OpenAiEventMapper {
                 events.push(Ok(LanguageModelCompletionEvent::Stop(StopReason::EndTurn)));
             }
             Some("tool_calls") => {
-                events.extend(self.tool_calls_by_index.drain().map(|(_, tool_call)| {
-                    match parse_tool_arguments(&tool_call.arguments) {
-                        Ok(input) => Ok(LanguageModelCompletionEvent::ToolUse(
-                            LanguageModelToolUse {
-                                id: tool_call.id.clone().into(),
-                                name: tool_call.name.as_str().into(),
-                                is_input_complete: true,
-                                input,
-                                raw_input: tool_call.arguments.clone(),
-                                thought_signature: None,
-                            },
-                        )),
-                        Err(error) => Ok(LanguageModelCompletionEvent::ToolUseJsonParseError {
-                            id: tool_call.id.into(),
-                            tool_name: tool_call.name.into(),
-                            raw_input: tool_call.arguments.clone().into(),
-                            json_parse_error: error.to_string(),
-                        }),
+                let tool_calls = std::mem::take(&mut self.tool_calls_by_index);
+                let tool_events_start = events.len();
+                for (_, tool_call) in tool_calls {
+                    let event = self.completed_tool_call_event(tool_call);
+                    if event.is_err() {
+                        events.truncate(tool_events_start);
+                        events.push(event);
+                        return events;
                     }
-                }));
+                    events.push(event);
+                }
 
                 events.push(Ok(LanguageModelCompletionEvent::Stop(StopReason::ToolUse)));
             }
@@ -715,6 +774,7 @@ pub struct OpenAiResponseEventMapper {
     reasoning_items: Vec<ResponseReasoningInputItem>,
     current_message_phase: Option<String>,
     pending_stop_reason: Option<StopReason>,
+    provider: LanguageModelProviderName,
 }
 
 #[derive(Default)]
@@ -726,11 +786,16 @@ struct PendingResponseFunctionCall {
 
 impl OpenAiResponseEventMapper {
     pub fn new() -> Self {
+        Self::for_provider(OPEN_AI_PROVIDER_NAME)
+    }
+
+    pub fn for_provider(provider: LanguageModelProviderName) -> Self {
         Self {
             function_calls_by_item: HashMap::default(),
             reasoning_items: Vec::new(),
             current_message_phase: None,
             pending_stop_reason: None,
+            provider,
         }
     }
 
@@ -742,7 +807,7 @@ impl OpenAiResponseEventMapper {
         events.flat_map(move |event| {
             futures::stream::iter(match event {
                 Ok(event) => self.map_event(event),
-                Err(error) => vec![Err(LanguageModelCompletionError::from(anyhow!(error)))],
+                Err(error) => vec![Err(map_stream_error(&self.provider, error))],
             })
         })
     }
@@ -1225,9 +1290,9 @@ mod tests {
     };
     use futures::{StreamExt, executor::block_on};
     use language_model_core::{
-        LanguageModelImage, LanguageModelRequestMessage, LanguageModelRequestTool,
-        LanguageModelToolResult, LanguageModelToolResultContent, LanguageModelToolUse,
-        LanguageModelToolUseId, SharedString, Speed,
+        LanguageModelImage, LanguageModelProviderName, LanguageModelRequestMessage,
+        LanguageModelRequestTool, LanguageModelToolResult, LanguageModelToolResultContent,
+        LanguageModelToolUse, LanguageModelToolUseId, SharedString, Speed,
     };
     use pretty_assertions::assert_eq;
     use serde_json::json;
@@ -1249,6 +1314,17 @@ mod tests {
         })
     }
 
+    fn map_response_results(
+        events: Vec<Result<ResponsesStreamEvent>>,
+    ) -> Vec<Result<LanguageModelCompletionEvent, LanguageModelCompletionError>> {
+        block_on(async {
+            OpenAiResponseEventMapper::for_provider(LanguageModelProviderName::new("Test Provider"))
+                .map_stream(Box::pin(futures::stream::iter(events)))
+                .collect::<Vec<_>>()
+                .await
+        })
+    }
+
     fn map_completion_events(
         events: Vec<ResponseStreamEvent>,
     ) -> Vec<LanguageModelCompletionEvent> {
@@ -1260,6 +1336,17 @@ mod tests {
         all_events.into_iter().filter_map(|e| e.ok()).collect()
     }
 
+    fn map_completion_results(
+        events: Vec<Result<ResponseStreamEvent>>,
+    ) -> Vec<Result<LanguageModelCompletionEvent, LanguageModelCompletionError>> {
+        block_on(async {
+            OpenAiEventMapper::for_provider(LanguageModelProviderName::new("Test Provider"))
+                .map_stream(Box::pin(futures::stream::iter(events)))
+                .collect::<Vec<_>>()
+                .await
+        })
+    }
+
     fn response_item_message(id: &str) -> ResponseOutputItem {
         ResponseOutputItem::Message(ResponseOutputMessage {
             id: Some(id.to_string()),
@@ -1268,6 +1355,27 @@ mod tests {
             content: vec![],
             phase: None,
         })
+    }
+
+    #[test]
+    fn open_ai_stream_parse_errors_become_provider_compatibility_errors() {
+        let line = r#"data: {"choices":[{"index":0,"delta":{"tool_calls":[{"id":"call_1","type":"function","function":{"name":"read_file","arguments":"{}"}}]},"finish_reason":null}]}"#;
+        let parse_error = crate::parse_response_stream_line(line)
+            .expect("line should produce a stream item")
+            .expect_err("missing tool call index should fail spec parsing");
+
+        let mapped = map_completion_results(vec![Err(parse_error)]);
+
+        assert!(matches!(
+            &mapped[0],
+            Err(LanguageModelCompletionError::ProviderCompatibilityError {
+                provider,
+                spec,
+                message,
+            }) if provider.to_string() == "Test Provider"
+                && spec == "OpenAI Chat Completions"
+                && message.contains("tool_calls")
+        ));
     }
 
     fn response_item_function_call(id: &str, args: Option<&str>) -> ResponseOutputItem {
@@ -1293,6 +1401,28 @@ mod tests {
             encrypted_content: encrypted_content.map(str::to_string),
             status,
         }
+    }
+
+    #[test]
+    fn responses_stream_parse_errors_become_provider_compatibility_errors() {
+        let line = r#"data: {"type":"response.output_text.delta","delta":{"secret":"token"}}"#;
+        let parse_error = crate::responses::parse_response_stream_line(line)
+            .expect("line should produce a stream item")
+            .expect_err("malformed response event should fail spec parsing");
+
+        let mapped = map_response_results(vec![Err(parse_error)]);
+
+        assert!(matches!(
+            &mapped[0],
+            Err(LanguageModelCompletionError::ProviderCompatibilityError {
+                provider,
+                spec,
+                message,
+            }) if provider.to_string() == "Test Provider"
+                && spec == "OpenAI Responses API"
+                && !message.is_empty()
+                && !message.contains("token")
+        ));
     }
 
     #[test]
@@ -3319,6 +3449,65 @@ mod tests {
                 LanguageModelCompletionEvent::Stop(StopReason::ToolUse)
             )
         }));
+    }
+
+    #[test]
+    fn open_ai_stream_rejects_completed_tool_calls_missing_identity() {
+        for (tool_call_id, function_name, expected_message) in [
+            (
+                None,
+                Some("read_file"),
+                "`choices[].delta.tool_calls[].id` is missing or empty",
+            ),
+            (
+                Some("call_1"),
+                None,
+                "`choices[].delta.tool_calls[].function.name` is missing or empty",
+            ),
+        ] {
+            let mapped = map_completion_results(vec![
+                Ok(ResponseStreamEvent {
+                    choices: vec![ChoiceDelta {
+                        index: 0,
+                        delta: Some(ResponseMessageDelta {
+                            role: None,
+                            content: None,
+                            tool_calls: Some(vec![ToolCallChunk {
+                                index: 0,
+                                id: tool_call_id.map(str::to_string),
+                                function: Some(FunctionChunk {
+                                    name: function_name.map(str::to_string),
+                                    arguments: Some("{}".into()),
+                                }),
+                            }]),
+                            reasoning_content: None,
+                        }),
+                        finish_reason: None,
+                    }],
+                    usage: None,
+                }),
+                Ok(ResponseStreamEvent {
+                    choices: vec![ChoiceDelta {
+                        index: 0,
+                        delta: None,
+                        finish_reason: Some("tool_calls".into()),
+                    }],
+                    usage: None,
+                }),
+            ]);
+
+            assert_eq!(mapped.len(), 1);
+            assert!(matches!(
+                &mapped[0],
+                Err(LanguageModelCompletionError::ProviderCompatibilityError {
+                    provider,
+                    spec,
+                    message,
+                }) if provider.to_string() == "Test Provider"
+                    && spec == "OpenAI Chat Completions"
+                    && message == expected_message
+            ));
+        }
     }
 
     #[test]

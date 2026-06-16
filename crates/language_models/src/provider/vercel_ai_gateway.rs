@@ -487,7 +487,7 @@ impl LanguageModel for VercelAiGatewayLanguageModel {
         );
         let completions = self.stream_open_ai(request, cx);
         async move {
-            let mapper = crate::provider::open_ai::OpenAiEventMapper::new();
+            let mapper = crate::provider::open_ai::OpenAiEventMapper::for_provider(PROVIDER_NAME);
             Ok(mapper.map_stream(completions.await?).boxed())
         }
         .boxed()

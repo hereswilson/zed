@@ -10,13 +10,15 @@ use http_client::{
     http::{HeaderMap, HeaderValue},
 };
 pub use language_model_core::ReasoningEffort;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::Value;
 use std::{convert::TryFrom, future::Future};
 use strum::EnumIter;
 use thiserror::Error;
 
 pub const OPEN_AI_API_URL: &str = "https://api.openai.com/v1";
+pub(crate) const OPEN_AI_CHAT_COMPLETIONS_SPEC: &str = "OpenAI Chat Completions";
+pub(crate) const OPEN_AI_RESPONSES_API_SPEC: &str = "OpenAI Responses API";
 
 fn is_none_or_empty<T: AsRef<[U]>, U>(opt: &Option<T>) -> bool {
     opt.as_ref().is_none_or(|v| v.as_ref().is_empty())
@@ -399,7 +401,7 @@ impl Model {
 
 #[cfg(test)]
 mod tests {
-    use super::{Model, ReasoningEffort};
+    use super::{Model, ReasoningEffort, ResponseStreamParseError, parse_response_stream_line};
 
     #[test]
     fn gpt_5_1_uses_none_reasoning_by_default() {
@@ -469,6 +471,35 @@ mod tests {
             Model::FivePointThreeCodex.supported_reasoning_efforts(),
             expected_efforts.as_slice()
         );
+    }
+
+    #[test]
+    fn response_stream_line_reports_parse_error_for_malformed_tool_call_indexes() {
+        for tool_call in [
+            r#"{"id":"call_1","type":"function","function":{"name":"read_file","arguments":"{}"}}"#,
+            r#"{"index":null,"id":"call_1","type":"function","function":{"name":"read_file","arguments":"{}"}}"#,
+            r#"{"index":"0","id":"call_1","type":"function","function":{"name":"read_file","arguments":"{}"}}"#,
+            r#"{"index":-1,"id":"call_1","type":"function","function":{"name":"read_file","arguments":"{}"}}"#,
+        ] {
+            let line = format!(
+                r#"data: {{"choices":[{{"index":0,"delta":{{"tool_calls":[{}]}},"finish_reason":null}}]}}"#,
+                tool_call
+            );
+
+            let error = parse_response_stream_line(&line)
+                .expect("line should produce a stream item")
+                .expect_err("malformed tool call index should fail spec parsing");
+            let error = error
+                .downcast_ref::<ResponseStreamParseError>()
+                .expect("malformed tool call index should be classified as a parse error");
+
+            assert_eq!(
+                error.to_string(),
+                "failed to parse OpenAI Chat Completions stream event: \
+                `choices[].delta.tool_calls[].index` is missing or invalid"
+            );
+            assert!(!error.to_string().contains("read_file"));
+        }
     }
 }
 
@@ -735,6 +766,101 @@ pub struct ResponseStreamEvent {
     pub usage: Option<Usage>,
 }
 
+const INVALID_TOOL_CALL_INDEX_MESSAGE: &str =
+    "`choices[].delta.tool_calls[].index` is missing or invalid";
+
+#[derive(Error, Debug)]
+#[error("failed to parse {spec} stream event: {message}")]
+pub(crate) struct ResponseStreamParseError {
+    pub(crate) spec: &'static str,
+    #[source]
+    source: serde_json::Error,
+    pub(crate) message: String,
+}
+
+fn response_stream_parse_message(line: &str, error: &serde_json::Error) -> String {
+    if has_missing_or_invalid_tool_call_index(line) {
+        INVALID_TOOL_CALL_INDEX_MESSAGE.to_string()
+    } else {
+        default_stream_parse_message(line, error)
+    }
+}
+
+pub(crate) fn default_stream_parse_message(_: &str, error: &serde_json::Error) -> String {
+    error.to_string()
+}
+
+fn has_missing_or_invalid_tool_call_index(line: &str) -> bool {
+    let Ok(value) = serde_json::from_str::<Value>(line) else {
+        return false;
+    };
+
+    value
+        .get("choices")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|choice| choice.get("delta"))
+        .filter_map(|delta| delta.get("tool_calls"))
+        .filter_map(Value::as_array)
+        .flatten()
+        .any(|tool_call| {
+            !matches!(
+                tool_call.get("index").and_then(Value::as_i64),
+                Some(index) if index >= 0
+            )
+        })
+}
+
+pub(crate) fn parse_sse_data_line<T>(
+    line: &str,
+    spec: &'static str,
+    ignore_empty: bool,
+    parse_message: impl FnOnce(&str, &serde_json::Error) -> String,
+) -> Option<Result<T>>
+where
+    T: DeserializeOwned,
+{
+    let line = line
+        .strip_prefix("data: ")
+        .or_else(|| line.strip_prefix("data:"))?;
+    if line == "[DONE]" || (ignore_empty && line.is_empty()) {
+        return None;
+    }
+
+    match serde_json::from_str(line) {
+        Ok(event) => Some(Ok(event)),
+        Err(error) => {
+            let message = parse_message(line, &error);
+            log::error!(
+                "Failed to parse {spec} stream event: `{}`. {}",
+                error,
+                message,
+            );
+            Some(Err(ResponseStreamParseError {
+                spec,
+                source: error,
+                message,
+            }
+            .into()))
+        }
+    }
+}
+
+pub(crate) fn parse_response_stream_line(line: &str) -> Option<Result<ResponseStreamEvent>> {
+    parse_sse_data_line::<ResponseStreamResult>(
+        line,
+        OPEN_AI_CHAT_COMPLETIONS_SPEC,
+        false,
+        response_stream_parse_message,
+    )
+    .map(|result| match result {
+        Ok(ResponseStreamResult::Ok(response)) => Ok(response),
+        Ok(ResponseStreamResult::Err { error }) => Err(anyhow!(error.message)),
+        Err(error) => Err(error),
+    })
+}
+
 pub async fn non_streaming_completion(
     client: &dyn HttpClient,
     api_url: &str,
@@ -808,28 +934,7 @@ pub async fn stream_completion(
             .lines()
             .filter_map(|line| async move {
                 match line {
-                    Ok(line) => {
-                        let line = line.strip_prefix("data: ").or_else(|| line.strip_prefix("data:"))?;
-                        if line == "[DONE]" {
-                            None
-                        } else {
-                            match serde_json::from_str(line) {
-                                Ok(ResponseStreamResult::Ok(response)) => Some(Ok(response)),
-                                Ok(ResponseStreamResult::Err { error }) => {
-                                    Some(Err(anyhow!(error.message)))
-                                }
-                                Err(error) => {
-                                    log::error!(
-                                        "Failed to parse OpenAI response into ResponseStreamResult: `{}`\n\
-                                        Response: `{}`",
-                                        error,
-                                        line,
-                                    );
-                                    Some(Err(anyhow!(error)))
-                                }
-                            }
-                        }
-                    }
+                    Ok(line) => parse_response_stream_line(&line),
                     Err(error) => Some(Err(anyhow!(error))),
                 }
             })

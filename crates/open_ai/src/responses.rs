@@ -343,6 +343,15 @@ pub enum StreamEvent {
     Unknown,
 }
 
+pub(crate) fn parse_response_stream_line(line: &str) -> Option<Result<StreamEvent>> {
+    crate::parse_sse_data_line(
+        line,
+        crate::OPEN_AI_RESPONSES_API_SPEC,
+        true,
+        crate::default_stream_parse_message,
+    )
+}
+
 #[derive(Deserialize, Debug, Default, Clone)]
 pub struct ResponseSummary {
     #[serde(default)]
@@ -485,26 +494,7 @@ pub async fn stream_response(
                 .lines()
                 .filter_map(|line| async move {
                     match line {
-                        Ok(line) => {
-                            let line = line
-                                .strip_prefix("data: ")
-                                .or_else(|| line.strip_prefix("data:"))?;
-                            if line == "[DONE]" || line.is_empty() {
-                                None
-                            } else {
-                                match serde_json::from_str::<StreamEvent>(line) {
-                                    Ok(event) => Some(Ok(event)),
-                                    Err(error) => {
-                                        log::error!(
-                                            "Failed to parse OpenAI responses stream event: `{}`\nResponse: `{}`",
-                                            error,
-                                            line,
-                                        );
-                                        Some(Err(anyhow!(error)))
-                                    }
-                                }
-                            }
-                        }
+                        Ok(line) => parse_response_stream_line(&line),
                         Err(error) => Some(Err(anyhow!(error))),
                     }
                 })

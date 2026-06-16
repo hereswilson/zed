@@ -699,7 +699,7 @@ impl LanguageModel for OpenCodeLanguageModel {
                 let stream =
                     self.stream_openai_chat(openai_request, http_client, extra_headers, cx);
                 async move {
-                    let mapper = OpenAiEventMapper::new();
+                    let mapper = OpenAiEventMapper::for_provider(PROVIDER_NAME);
                     Ok(mapper.map_stream(stream.await?).boxed())
                 }
                 .boxed()
